@@ -1,0 +1,200 @@
+//==============================================================================
+// Robb Wave Organ - AMORPH Emulation (Bridge Street United Church inspired)
+// Paste this entire block into Amorph Instrument editor
+//==============================================================================
+
+graph RobbWaveOrgan
+{
+    // ────────────────────────────────────────────────────────────────
+    // Inputs / Outputs
+    // ────────────────────────────────────────────────────────────────
+    input midiIn: midi;
+    output audioOut: stereo;
+
+    // ────────────────────────────────────────────────────────────────
+    // Parameters (auto-mapped to knobs in Amorph UI)
+    // ────────────────────────────────────────────────────────────────
+    parameter morphAmount: float { min: 0, max: 1, default: 0.3, step: 0.01, name: "AMORPH Morph" };
+    parameter tubeDrive:   float { min: 0.5, max: 8.0, default: 2.2, step: 0.1, name: "Tube Drive" };
+    parameter tubeBias:    float { min: 0.0, max: 0.3, default: 0.08, step: 0.01, name: "Tube Bias" };
+    parameter jitterAmt:   float { min: 0.0, max: 0.05, default: 0.018, step: 0.001, name: "Mechanical Jitter" };
+    parameter masterGain:  float { min: 0.0, max: 2.0, default: 0.8, step: 0.05, name: "Master Gain" };
+
+    // Simple drawbar emulation (8' fundamental only for simplicity)
+    parameter drawbar8:    float { min: 0, max: 8, default: 5, step: 0.5, name: "8' Drawbar" };
+
+    // ────────────────────────────────────────────────────────────────
+    // State (per-voice data)
+    // ────────────────────────────────────────────────────────────────
+    var voices: array<struct { phase: float64, active: bool, note: int32, vel: float }>[16];
+    var lpState: float = 0.0;   // shared 1-pole LP state for carved path (simple approximation)
+
+    // ────────────────────────────────────────────────────────────────
+    // Wavetable data (you would normally load these externally)
+    // For demo: procedural additive approximation of a Diapason stop
+    // In real usage: replace with sampled Bridge Street waveforms
+    // ────────────────────────────────────────────────────────────────
+    let wtSize = 2048;
+    let tableA = generateIdealTable();      // clean version
+    let tableB = generateCarvedTable();     // degraded version
+
+    // ────────────────────────────────────────────────────────────────
+    // Helper: generate ideal additive table (Bridge Street Diapason-like)
+    // ────────────────────────────────────────────────────────────────
+    function generateIdealTable() -> float[wtSize]
+    {
+        let phase = linspace(0.0, twoPi, wtSize);
+        var sum = float[wtSize](0.0);
+
+        let weights = float[7](1.0, 0.55, 0.38, 0.25, 0.15, 0.09, 0.05);
+
+        for h in 1..8
+        {
+            let w = weights[h-1];
+            sum += w * sin(phase * float(h));
+        }
+
+        let maxVal = max(abs(sum));
+        return sum / maxVal;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Helper: generate carved table with micro-imperfections
+    // ────────────────────────────────────────────────────────────────
+    function generateCarvedTable() -> float[wtSize]
+    {
+        let ideal = generateIdealTable();
+        var carved = ideal;
+
+        // Add jitter-like position noise (precomputed for simplicity)
+        let noise = noiseArray(wtSize, 0.018f);
+
+        for i in 0..wtSize
+        {
+            let shifted = (i + int(noise[i] * 8.0)) % wtSize;
+            carved[i] = ideal[shifted];
+        }
+
+        // Apply gentle low-pass simulation (very approximate)
+        for i in 1..wtSize
+            carved[i] = 0.78 * carved[i] + 0.22 * carved[i-1];
+
+        return carved;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Process block
+    // ────────────────────────────────────────────────────────────────
+    processor process()
+    {
+        let midiMsg = midiIn.next();
+
+        // Handle note on/off very simply (monophonic for clarity)
+        if (midiMsg.isNoteOn())
+        {
+            let idx = findFreeVoice();
+            if (idx >= 0)
+            {
+                voices[idx].phase = 0.0;
+                voices[idx].note = midiMsg.note;
+                voices[idx].vel = midiMsg.velocity / 127.0f;
+                voices[idx].active = true;
+            }
+        }
+        else if (midiMsg.isNoteOff())
+        {
+            for v in voices
+                if (v.active && v.note == midiMsg.note)
+                    v.active = false;
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // Audio generation
+        // ────────────────────────────────────────────────────────────────
+        var mono = 0.0f;
+
+        for v in voices
+        {
+            if (!v.active) continue;
+
+            let freq = midiToFreq(v.note) * drawbar8 / 5.0; // simple 8' scaling
+            let inc = freq * twoPi / sampleRate;
+
+            v.phase += inc;
+            if (v.phase >= twoPi) v.phase -= twoPi;
+
+            let normPhase = v.phase / twoPi;
+
+            // ────────────────────────────────────────────────────────────────
+            // AMORPH core
+            // ────────────────────────────────────────────────────────────────
+            let idealSample = wtLookup(tableA, normPhase);
+
+            // Jitter only on carved path
+            let jitterOffset = (rand(-1,1) * jitterAmt);
+            let jitterPhase = normPhase + jitterOffset;
+            let carvedRaw = wtLookup(tableB, frac(jitterPhase));
+
+            // 1-pole LP on carved path
+            lpState = 0.78 * carvedRaw + 0.22 * lpState;
+            let carvedSample = lpState;
+
+            // Asymmetric morph
+            let morphed = lerp(idealSample, carvedSample, morphAmount);
+
+            mono += morphed * v.vel * 0.25f; // headroom
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // Vacuum tube saturation (asymmetric tanh)
+        // ────────────────────────────────────────────────────────────────
+        let shifted = mono * tubeDrive + tubeBias;
+        let saturated = tanh(shifted);
+        let dcOffset = tanh(tubeBias);
+        let warmed = saturated - dcOffset;
+
+        // Output
+        let final = warmed * masterGain;
+        audioOut << (final, final);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Helpers
+    // ────────────────────────────────────────────────────────────────
+    function midiToFreq(note: int32) -> float
+    {
+        return 440.0 * pow(2.0, (note - 69) / 12.0);
+    }
+
+    function wtLookup(table: float[wtSize], phase: float) -> float
+    {
+        let idx = phase * (wtSize - 1);
+        let i0 = int(idx);
+        let frac = idx - float(i0);
+        let i1 = (i0 + 1) % wtSize;
+        return table[i0] + frac * (table[i1] - table[i0]);
+    }
+
+    function findFreeVoice() -> int
+    {
+        for i in 0..voices.size
+            if (!voices[i].active) return i;
+        return -1;
+    }
+
+    function lerp(a: float, b: float, t: float) -> float
+    {
+        return a + t * (b - a);
+    }
+
+    function frac(x: float) -> float
+    {
+        return x - floor(x);
+    }
+
+    function rand(min: float, max: float) -> float
+    {
+        // Very crude noise – replace with better PRNG in production
+        return min + (max - min) * (float(noise()) % 1.0);
+    }
+}
